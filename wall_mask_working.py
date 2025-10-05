@@ -93,15 +93,26 @@ def process_image(path: str, model: DeepLab):
         prediction = _midas(input_tensor)                           # [1,1,H,W]
     depth = prediction.squeeze().cpu().numpy()                      # [H,W] floats
 
-    # Resize to original resolution
+     # Resize to original resolution
     depth_resized = cv2.resize(depth, (w, h), interpolation=cv2.INTER_CUBIC)
+
+    # ---------- save raw depth (grayscale + colour) ----------
+    depth_min, depth_max = depth_resized.min(), depth_resized.max()
+    depth_raw_norm = (depth_resized - depth_min) / (depth_max - depth_min + 1e-8)
+    depth_u8 = (depth_raw_norm * 255).astype(np.uint8)
+
+    cv2.imwrite("depth_raw_gray.png", depth_u8)
+    cv2.imwrite("depth_raw_color.png",
+    cv2.applyColorMap(depth_u8, cv2.COLORMAP_MAGMA))
+    # ---------------------------------------------------------
+   
 
     # Normalize to 0–1 float range
     minD, maxD = depth_resized.min(), depth_resized.max()
     depth_norm = (depth_resized - minD) / (maxD - minD + 1e-8)
 
     # Threshold at brightness 0.1 → binary mask
-    bin_mask = (depth_norm > 0.15).astype(np.uint8) * 255           # 0 or 255
+    bin_mask = (depth_norm > 0.05).astype(np.uint8) * 255           # 0 or 255
 
     # Optional: convert to 3-channel for consistency
     bin_color = cv2.cvtColor(bin_mask, cv2.COLOR_GRAY2BGR)
