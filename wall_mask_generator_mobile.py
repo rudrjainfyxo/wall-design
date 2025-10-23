@@ -89,29 +89,56 @@ def order_quad(q):
     return np.array([q[np.argmin(s)], q[np.argmin(d)],
                      q[np.argmax(s)], q[np.argmax(d)]], np.float32)
 
+# ───────── geometry helpers ──────────────────────────────────────
 def wall_quad(mask):
-    cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnt = max(cnts, key=cv2.contourArea)
-    poly = cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True)
-    quad = poly.reshape(-1,2) if len(poly)==4 \
-           else cv2.boxPoints(cv2.minAreaRect(cnt))
+    """Return a robust 4-point quad (TL, TR, BR, BL) around the mask."""
+    ys, xs = np.where(mask > 0)
+    pts = np.column_stack((xs, ys)).astype(np.int32)
+    hull = cv2.convexHull(pts)
+    rect = cv2.minAreaRect(hull)
+    quad = cv2.boxPoints(rect)              # 4×2 float32
     return order_quad(quad.astype(np.float32))
 
-# ─── orientation helper (additive) ───────────────────────────────
-def plane_angles(quad, W, H):
-    """Return (pitch_x, yaw_y, roll_z) in degrees (Unity order)."""
+
+def _homography_to_rotation_and_normal(quad, W, H):
+    """Internal: solve homography → R_cam→wall (3×3) and normal."""
     f = max(W, H)
-    K = np.array([[f,0,W/2], [0,f,H/2], [0,0,1]], np.float32)
-    Hm = cv2.getPerspectiveTransform(np.float32([[0,0],[1,0],[1,1],[0,1]]), quad)
-    Hn = np.linalg.inv(K) @ Hm
-    h1, h2 = Hn[:,0], Hn[:,1]
-    r1, r2 = h1/np.linalg.norm(h1), h2/np.linalg.norm(h2)
-    n = np.cross(r1, r2); n /= np.linalg.norm(n)
-    yaw   =  np.degrees(np.arctan2(n[0], n[2]))          # Y-axis
-    pitch = -np.degrees(np.arctan2(n[1], n[2]))          # X-axis (neg for Unity)
-    roll  =  np.degrees(np.arctan2(quad[1][1]-quad[0][1],
-                                   quad[1][0]-quad[0][0]))  # Z-axis
-    return pitch, yaw, roll
+    K = np.array([[f, 0, W / 2],
+                  [0, f, H / 2],
+                  [0, 0,   1  ]], np.float64)
+
+    Hm = cv2.getPerspectiveTransform(
+        np.float32([[0, 0], [1, 0], [1, 1], [0, 1]]), quad).astype(np.float64)
+
+    ok, Rs, _, ns = cv2.decomposeHomographyMat(Hm, K)
+    if not ok:
+        return np.eye(3), np.array([0, 0, -1], np.float32)
+
+    # choose the candidate whose normal faces the camera (nz < 0)
+    R_wall2cam, n_cam = next((R, n) for R, n in zip(Rs, ns) if n[2] < 0)
+
+    R_cam2wall = R_wall2cam.T          # invert rotation
+    n_cam = R_cam2wall[:, 2]           # Z column is plane normal
+    n_cam /= np.linalg.norm(n_cam)
+    return R_cam2wall, n_cam.astype(np.float32)
+
+
+def wall_pose(quad, W, H):
+    """
+    High-level helper used by FastAPI wrapper.
+
+    Returns:
+      pitch, yaw, roll  (degrees, X-Y-Z, Unity order)
+      normal            (3-vector, camera space)
+    """
+    R, n = _homography_to_rotation_and_normal(quad, W, H)
+
+    pitch =  np.degrees(np.arctan2(R[2, 1], R[2, 2]))     # X
+    yaw   =  np.degrees(np.arctan2(-R[2, 0],
+                                   np.sqrt(R[2, 1]**2 + R[2, 2]**2)))  # Y
+    roll  =  np.degrees(np.arctan2(R[1, 0], R[0, 0]))     # Z
+
+    return pitch, yaw, roll, n
 
 # ─── HQ-SAM refine ───────────────────────────────────────────────
 def hqsam_refine(photo_bgr, coarse_mask):
