@@ -151,7 +151,14 @@ def hqsam_refine(photo_bgr, coarse_mask):
                                   multimask_output=False)
     m0 = masks[0];  m0 = m0.cpu().numpy() if hasattr(m0,"cpu") else m0
     sam_mask = (m0.astype(np.uint8)*255)
-    return clean_mask(coarse_mask | sam_mask)
+    # return clean_mask(coarse_mask | sam_mask)
+    refined = clean_mask(coarse_mask | sam_mask)
+
+    if FEATHER_PX > 0:                          # e.g. FEATHER_PX = 3
+        # Gaussian σ = FEATHER_PX; kernel size  auto-determined (0,0)
+        refined = cv2.GaussianBlur(refined, (0, 0), FEATHER_PX)
+
+    return refined
 
 # ─── segmentation helpers ─────────────────────────────────────────
 def deeplab_bool(img, dl):
