@@ -1,0 +1,5 @@
+names:
+  0: ceiling
+  1: wall
+nc: 2
+task: segment

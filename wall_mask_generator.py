@@ -24,7 +24,7 @@ from pathlib import Path
 # ───────── CONFIG ─────────────────────────────────────────────────
 LABEL_WALL   = 1
 DEEPLAB_TAR  = 'deeplabv3_mnv2_ade20k_train_2018_12_03.tar.gz'
-YOLO_WEIGHTS = 'weights.pt'
+YOLO_WEIGHTS = 'weights.onnx'
 YOLO_SRC     = Path.home() / 'code' / 'ultralytics'
 CONF_DEF     = 0.40
 TILE_IMG     = 'tile.jpeg'          # 1-pixel-trimmed tile (tiling only)
@@ -140,6 +140,10 @@ def wall_pose(quad, W, H):
 
     return pitch, yaw, roll, n
 
+def plane_angles(quad, W, H):
+    """Return (pitch, yaw, roll) like the old helper, using wall_pose()."""
+    pitch, yaw, roll, _ = wall_pose(quad, W, H)
+    return pitch, yaw, roll
 # ─── HQ-SAM refine ───────────────────────────────────────────────
 def hqsam_refine(photo_bgr, coarse_mask):
     if coarse_mask.sum()==0:
@@ -168,7 +172,7 @@ def yolo_masks(path, yolo, conf, dense_bool):
     res = yolo.predict(path, imgsz=640, conf=conf, iou=0.5, verbose=False)[0]
     if res.masks is None:
         return []
-    wall_id = {v.lower():k for k,v in yolo.model.names.items()}['wall']
+    wall_id = {v.lower():k for k,v in yolo.names.items()}['wall']
     idx = np.where(res.boxes.cls.cpu().numpy().astype(int)==wall_id)[0]
     img = cv2.imread(path); H,W = img.shape[:2]
     files=[]
@@ -244,7 +248,7 @@ if __name__ == '__main__':
     args = ap.parse_args()
 
     dl   = DeepLab()          # load DeepLab once
-    yolo = YOLO(YOLO_WEIGHTS) # load YOLO once
+    yolo = YOLO(YOLO_WEIGHTS, task='segment') # load YOLO once
 
     t_all = time.perf_counter()
     for p in args.images:

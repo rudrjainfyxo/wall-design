@@ -45,7 +45,7 @@ def main():
     # 1) Load model
     model = YOLO(args.model, task=args.task)
     # 2) Inject class names
-    model.model.names = load_names(args.yaml)
+    model.names = load_names(args.yaml)
 
     # 3) Run inference
     results = model(args.source, imgsz=args.imgsz, conf=args.conf, save=True)
