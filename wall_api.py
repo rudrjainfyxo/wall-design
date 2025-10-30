@@ -7,7 +7,7 @@ Launch:
     uvicorn wall_api:app --host 0.0.0.0 --port 8000 --reload
 """
 
-import uuid, os, shutil, importlib
+import uuid, os, shutil, importlib, time
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -15,37 +15,74 @@ import cv2
 
 # ── helper class that keeps models resident ──────────────────────
 class WallRefiner:
-    """Wraps one generator module (mobile or hq) and keeps its weights in RAM."""
+    """Wraps one generator module (mobile or hq) and keeps its weights in RAM, with per-stage timing."""
+
     def __init__(self, rw_module):
-        self.rw    = rw_module
-        self.dl    = rw_module.DeepLab()
-        self.yolo  = rw_module.YOLO(rw_module.YOLO_WEIGHTS)
+        self.rw = rw_module
+        t0 = time.perf_counter()
+        self.dl = rw_module.DeepLab()
+        t1 = time.perf_counter()
+        self.yolo = rw_module.YOLO(rw_module.YOLO_WEIGHTS)
+        t2 = time.perf_counter()
+        # HQ-SAM predictor is already created globally in each rw_module
+        self.sam_ready = hasattr(rw_module, "predictor")
+        self.load_time = {
+            "deeplab_load_s": round(t1 - t0, 2),
+            "yolo_load_s": round(t2 - t1, 2),
+            "total_model_load_s": round(t2 - t0, 2)
+        }
 
     def run(self, img_path: str):
-        rw   = self.rw
-        img  = cv2.imread(img_path)
+        times = dict(self.load_time)  # start with model load timings
+        t_total0 = time.perf_counter()
+
+        # ─ image read ─
+        t0 = time.perf_counter()
+        img = cv2.imread(img_path)
         if img is None:
             raise ValueError("Cannot read image")
+        times["image_read_s"] = round(time.perf_counter() - t0, 2)
 
-        dense   = rw.deeplab_bool(img, self.dl)
-        masks   = rw.yolo_masks(img_path, self.yolo, rw.CONF_DEF, dense)
-        union   = rw.central_union(masks, *img.shape[:2])
-        refined = rw.hqsam_refine(img, union)
+        # ─ DeepLab ─
+        t1 = time.perf_counter()
+        dense = self.rw.deeplab_bool(img, self.dl)
+        times["deeplab_infer_s"] = round(time.perf_counter() - t1, 2)
+
+        # ─ YOLO ─
+        t2 = time.perf_counter()
+        masks = self.rw.yolo_masks(img_path, self.yolo, self.rw.CONF_DEF, dense)
+        times["yolo_infer_s"] = round(time.perf_counter() - t2, 2)
+
+        # ─ union + HQ-SAM refine ─
+        t3 = time.perf_counter()
+        union = self.rw.central_union(masks, *img.shape[:2])
+        refined = self.rw.hqsam_refine(img, union)
+        times["sam_refine_s"] = round(time.perf_counter() - t3, 2)
+
         if refined.sum() == 0:
             raise ValueError("No wall mask produced")
 
-        quad = rw.wall_quad(refined)
-        pitch, yaw, roll, normal = rw.wall_pose(quad, img.shape[1], img.shape[0])
+        # ─ pose compute ─
+        t4 = time.perf_counter()
+        quad = self.rw.wall_quad(refined)
+        pitch, yaw, roll, normal = self.rw.wall_pose(quad, img.shape[1], img.shape[0])
+        times["pose_compute_s"] = round(time.perf_counter() - t4, 2)
 
+        # ─ write mask ─
+        t5 = time.perf_counter()
         out_mask = Path(img_path).with_suffix(".mask.png")
         cv2.imwrite(str(out_mask), refined)
+        times["mask_write_s"] = round(time.perf_counter() - t5, 2)
+
+        times["total_pipeline_s"] = round(time.perf_counter() - t_total0, 2)
 
         return {
             "mask_path": str(out_mask),
             "pitch": pitch,
-            "yaw":   yaw,
-            "roll":  roll,
+            "yaw": yaw,
+            "roll": roll,
             "normal": normal,
+            "timings": times,
         }
 
 # ── load both generators once ────────────────────────────────────
@@ -64,7 +101,7 @@ MASK_DIR.mkdir(exist_ok=True)
 app = FastAPI(
     title="Wall-Mask Refinement API",
     description="YOLO ∩ DeepLab ∪ HQ-SAM (mobile & HQ) wrapped in FastAPI",
-    version="0.4.0",
+    version="0.5.0",
 )
 
 app.mount("/masks", StaticFiles(directory=str(MASK_DIR)), name="masks")
@@ -101,6 +138,7 @@ def _handle(file: UploadFile, model_key: str):
             "z": round(float(res["normal"][2]), 4),
         },
         "mask_url": f"/masks/{out_name}",
+        "timings_s": res["timings"],   # ← new detailed per-stage timings
     }
 
 # ── two explicit routes ------------------------------------------
