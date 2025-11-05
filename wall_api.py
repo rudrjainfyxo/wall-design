@@ -83,6 +83,19 @@ class WallRefiner:
         refined = self.rw.hqsam_refine(img, union)
         times["sam_refine_s"] = round(time.perf_counter() - t3, 2)
 
+                # ─ Fallback if refined mask area too small ─────────────────────────────
+        H, W = img.shape[:2]
+        total_pixels = H * W
+        refined_area = int((refined > 0).sum())
+        ratio = refined_area / total_pixels if total_pixels else 0
+        res_fallback = False
+
+        if ratio < 0.2:
+            print(f"[WARN] Fallback → refined mask area only {ratio*100:.1f}% of image. Using DeepLab mask.")
+            refined = (dense.astype('uint8')) * 255
+            res_fallback = True
+
+
         if refined.sum() == 0:
             raise ValueError("No wall mask produced")
 
@@ -125,6 +138,7 @@ class WallRefiner:
             }
 
         debug["hardware"] = hw_debug
+        debug["fallback_used"] = res_fallback
 
         return {
             "mask_path": str(out_mask),
@@ -207,6 +221,7 @@ def _handle(file: UploadFile, model_key: str):
             "y": round(float(res["normal"][1]), 4),
             "z": round(float(res["normal"][2]), 4),
         },
+        "fallback_used": res["debug"].get("fallback_used", False),
         **({"wall_size_m": wall_size} if wall_size else {}),
         "original_url": f"/masks/{orig_name}",
         "mask_url":     f"/masks/{mask_name}",

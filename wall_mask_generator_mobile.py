@@ -26,14 +26,44 @@ LABEL_WALL   = 1
 DEEPLAB_TAR  = 'deeplabv3_mnv2_ade20k_train_2018_12_03.tar.gz'
 YOLO_WEIGHTS = 'weights.pt'
 YOLO_SRC     = Path.home() / 'code' / 'ultralytics'
-CONF_DEF     = 0.40
+CONF_DEF     = 0.35
 TILE_IMG     = 'tile.jpeg'          # 1-pixel-trimmed tile (tiling only)
 FEATHER_PX   = 3
 CLEAN_K      = 7
 CLEAN_SIGMA  = 1.5
 SAM_WEIGHTS  = 'sam_vit_b_01ec64.pth'   # ViT-L backbone (faster on M-series)
 MODEL_KEY    = 'vit_b'
+DEBUG_SAVE = True
 # ──────────────────────────────────────────────────────────────────
+
+# --- DEBUG OUTPUT SETTINGS ---------------------------------------
+DEBUG_SAVE = True                 # master switch
+CURRENT_BASENAME = "out"          # set per-image in process_one()
+
+def _dbg_name(tag: str) -> str:
+    from pathlib import Path
+    return f"{CURRENT_BASENAME}_dbg_{tag}.png"
+
+def _dbg(tag: str, img):
+    """Safe image writer for debug artifacts."""
+    if not DEBUG_SAVE:
+        return
+    try:
+        import numpy as np, cv2
+        a = img
+        # if boolean mask → 0/255
+        if a.dtype == bool:
+            a = (a.astype("uint8")) * 255
+        # if single-channel float/bool → scale/convert
+        if a.dtype != "uint8":
+            if a.ndim == 2:
+                a = np.clip(a, 0, 1) if a.max() <= 1.0 else np.clip(a, 0, 255)
+                a = (a * (255 if a.max() <= 1 else 1)).astype("uint8")
+        cv2.imwrite(_dbg_name(tag), a)
+    except Exception:
+        pass
+# ---------------------------------------------------------------
+
 
 sys.path.insert(0, str(YOLO_SRC))
 from ultralytics import YOLO                                # noqa: E402
@@ -142,37 +172,82 @@ def wall_pose(quad, W, H):
 
 # ─── HQ-SAM refine ───────────────────────────────────────────────
 def hqsam_refine(photo_bgr, coarse_mask):
-    if coarse_mask.sum()==0:
+    """Run SAM refinement; fall back to DeepLab if refined mask is too small or drifts far."""
+    if coarse_mask.sum() == 0:
+        _dbg("4a_sam_input_empty", coarse_mask)
         return coarse_mask
-    ys,xs = np.where(coarse_mask>0)
-    x0,x1,y0,y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
+
+    H, W = photo_bgr.shape[:2]
+    total_pixels = H * W
+
+    ys, xs = np.where(coarse_mask > 0)
+    x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
+
     predictor.set_image(cv2.cvtColor(photo_bgr, cv2.COLOR_BGR2RGB))
-    masks,_,_ = predictor.predict(box=np.array([[x0,y0,x1,y1]]),
-                                  multimask_output=False)
-    m0 = masks[0];  m0 = m0.cpu().numpy() if hasattr(m0,"cpu") else m0
-    sam_mask = (m0.astype(np.uint8)*255)
-    return clean_mask(coarse_mask | sam_mask)
+    masks, _, _ = predictor.predict(box=np.array([[x0, y0, x1, y1]]),
+                                    multimask_output=False)
+    m0 = masks[0]
+    m0 = m0.cpu().numpy() if hasattr(m0, "cpu") else m0
+    sam_mask = (m0.astype(np.uint8) * 255)
+    refined = clean_mask(coarse_mask | sam_mask)
+
+    # ─── diagnostics ────────────────────────────────────────────────
+    refined_area = np.count_nonzero(refined)
+    coarse_area  = np.count_nonzero(coarse_mask)
+    coverage_ratio = refined_area / total_pixels
+    intersection = np.logical_and(refined > 0, coarse_mask > 0).sum()
+    union        = np.logical_or(refined > 0, coarse_mask > 0).sum()
+    iou = intersection / union if union > 0 else 0
+
+    # ─── adaptive thresholds ───────────────────────────────────────
+    min_ratio = 0.25 if total_pixels > 512*512 else 0.15
+    min_iou   = 0.35
+
+    # ─── fallback condition ────────────────────────────────────────
+    if coverage_ratio < min_ratio or iou < min_iou:
+        print(f"[WARN] SAM mask fallback → area={coverage_ratio*100:.1f}%  IoU={iou:.2f}")
+        _dbg("4d_sam_too_small_or_drift", refined)
+        refined = clean_mask(coarse_mask)  # fallback to DeepLab
+
+    # ─── debug outputs ─────────────────────────────────────────────
+    _dbg("4a_sam_input", coarse_mask)
+    _dbg("4b_sam_raw", sam_mask)
+    _dbg("4c_sam_refined_final", refined)
+
+    return refined
 
 # ─── segmentation helpers ─────────────────────────────────────────
 def deeplab_bool(img, dl):
-    return (dl.infer(img) == LABEL_WALL)
+    mask = (dl.infer(img) == LABEL_WALL)
+    _dbg("1_deeplab_wall", mask)
+    return mask
+
 
 def yolo_masks(path, yolo, conf, dense_bool):
     res = yolo.predict(path, imgsz=640, conf=conf, iou=0.5, verbose=False)[0]
     if res.masks is None:
+        _dbg("2_yolo_nomask", np.zeros_like(cv2.imread(path)))
         return []
-    wall_id = {v.lower():k for k,v in yolo.model.names.items()}['wall']
-    idx = np.where(res.boxes.cls.cpu().numpy().astype(int)==wall_id)[0]
-    img = cv2.imread(path); H,W = img.shape[:2]
-    files=[]
-    for k,i in enumerate(idx):
-        m = cv2.resize(res.masks.data[i].cpu().numpy(), (W,H),
-                       cv2.INTER_NEAREST)*255
+
+    wall_id = {v.lower(): k for k, v in yolo.model.names.items()}['wall']
+    idx = np.where(res.boxes.cls.cpu().numpy().astype(int) == wall_id)[0]
+
+    img = cv2.imread(path); H, W = img.shape[:2]
+    files = []
+    union_all = np.zeros((H, W), np.uint8)
+
+    for k, i in enumerate(idx):
+        m = cv2.resize(res.masks.data[i].cpu().numpy(), (W, H),
+                       cv2.INTER_NEAREST) * 255
         m = clean_mask(m.astype(np.uint8))
-        r = clean_mask(((m>0)&dense_bool).astype(np.uint8)*255)
-        fname = f'wall{k:02d}_refined.png'
-        # cv2.imwrite(fname, r)      # ← enable debug masks
-        files.append((fname, r))
+        r = clean_mask(((m > 0) & dense_bool).astype(np.uint8) * 255)
+        files.append((f'wall{k:02d}_refined.png', r))
+        union_all |= r
+        _dbg(f"2_yolo_mask{k:02d}", r)
+
+    if len(idx) > 0:
+        _dbg("2_yolo_union", union_all)
+
     return files
 
 def central_union(named_masks, H, W, use_center_bias=True, center_ratio=0.25):
@@ -182,6 +257,7 @@ def central_union(named_masks, H, W, use_center_bias=True, center_ratio=0.25):
     """
     u = np.zeros((H, W), np.uint8)
     if not named_masks:
+        _dbg("3_union_empty_input", u)
         return u
 
     cx, cy = W / 2.0, H / 2.0
@@ -201,7 +277,6 @@ def central_union(named_masks, H, W, use_center_bias=True, center_ratio=0.25):
         else:
             kept.append(mask)
 
-    # union what we kept
     for m in kept:
         u |= m
 
@@ -210,6 +285,7 @@ def central_union(named_masks, H, W, use_center_bias=True, center_ratio=0.25):
         biggest = max((m.sum(), m) for _, m in named_masks)[1]
         u = biggest.copy()
 
+    _dbg("3_union_mask", u)
     return u
 
 # ─── tiling routine (currently disabled) ───────────────────────────
@@ -249,11 +325,21 @@ def process_one(path, dl, yolo, conf):
     img = cv2.imread(path)
     if img is None:
         print('❌', path); return
+
+    # set basename for debug files
+    global CURRENT_BASENAME
+    CURRENT_BASENAME = Path(path).with_suffix('').name
+
+    _dbg("0_input", img)
+
     dense = deeplab_bool(img, dl)
     masks = yolo_masks(path, yolo, conf, dense)
     union = central_union(masks, img.shape[0], img.shape[1])
+    _dbg("3_union_mask_dup", union)  # harmless duplicate for convenience
+
     apply_tiles(img, union, 'refined')
     # apply_tiles(img, union, 'yolo')   # ← re-enable if needed
+
     dt = time.perf_counter() - t0
     print(f'✓ {Path(path).name}  ({dt:.2f}s)')
 
