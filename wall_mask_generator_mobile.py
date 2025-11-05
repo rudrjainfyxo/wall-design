@@ -175,13 +175,41 @@ def yolo_masks(path, yolo, conf, dense_bool):
         files.append((fname, r))
     return files
 
-def central_union(named_masks,H,W):
-    u = np.zeros((H,W),np.uint8)
-    cx,cy,rad2 = W/2, H/2, (0.15**2)*(H*H+W*W)
-    for fname,mask in named_masks:
-        if mask.sum()==0: continue
-        M=cv2.moments(mask); mx,my = M['m10']/M['m00'], M['m01']/M['m00']
-        if (mx-cx)**2 + (my-cy)**2 <= rad2: u |= mask
+def central_union(named_masks, H, W, use_center_bias=True, center_ratio=0.25):
+    """
+    Unions YOLO masks near the image center.
+    If that yields nothing, fall back to the largest YOLO mask.
+    """
+    u = np.zeros((H, W), np.uint8)
+    if not named_masks:
+        return u
+
+    cx, cy = W / 2.0, H / 2.0
+    rad2 = (center_ratio ** 2) * (H * H + W * W)
+
+    kept = []
+    for _, mask in named_masks:
+        if mask.sum() == 0:
+            continue
+        if use_center_bias:
+            M = cv2.moments(mask)
+            if M['m00'] == 0:
+                continue
+            mx, my = M['m10'] / M['m00'], M['m01'] / M['m00']
+            if (mx - cx) ** 2 + (my - cy) ** 2 <= rad2:
+                kept.append(mask)
+        else:
+            kept.append(mask)
+
+    # union what we kept
+    for m in kept:
+        u |= m
+
+    # --- fallback: biggest YOLO mask ---
+    if u.sum() == 0:
+        biggest = max((m.sum(), m) for _, m in named_masks)[1]
+        u = biggest.copy()
+
     return u
 
 # ─── tiling routine (currently disabled) ───────────────────────────

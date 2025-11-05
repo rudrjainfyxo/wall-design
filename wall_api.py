@@ -158,24 +158,43 @@ app = FastAPI(
 app.mount("/masks", StaticFiles(directory=str(MASK_DIR)), name="masks")
 
 # ─── Core handler ────────────────────────────────────────────────
+# ───────── core handler ─────────────────────────────────────────
 def _handle(file: UploadFile, model_key: str):
     if file.content_type not in ("image/jpeg", "image/png"):
         raise HTTPException(status_code=415, detail="JPEG or PNG only")
 
-    tmp_path = f"/tmp/{uuid.uuid4().hex}{Path(file.filename).suffix}"
-    with open(tmp_path, "wb") as fh:
+    # one UUID for both original photo and generated mask
+    uid = uuid.uuid4().hex
+    ext = Path(file.filename).suffix.lower() or ".jpg"
+    tmp = f"/tmp/{uid}{ext}"
+
+    # save upload to temp file
+    with open(tmp, "wb") as fh:
         shutil.copyfileobj(file.file, fh)
 
     try:
-        res = refiners[model_key].run(tmp_path)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        # run full pipeline
+        res = refiners[model_key].run(tmp)
 
-    out_name = f"{uuid.uuid4().hex}.png"
-    shutil.move(res["mask_path"], MASK_DIR / out_name)
+        # move the original image next to masks/
+        orig_name = f"{uid}{ext}"
+        shutil.move(tmp, MASK_DIR / orig_name)
+
+    except Exception as exc:
+        if os.path.exists(tmp):           # cleanup on failure
+            os.remove(tmp)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    # move the refined mask (always .png) next to original
+    mask_name = f"{uid}.png"
+    shutil.move(res["mask_path"], MASK_DIR / mask_name)
+
+    # optional wall-size values (only if present in res)
+    wall_size = (
+        {"width": res["width_m"], "height": res["height_m"]}
+        if "width_m" in res and "height_m" in res
+        else None
+    )
 
     return {
         "rotation": {
@@ -188,9 +207,11 @@ def _handle(file: UploadFile, model_key: str):
             "y": round(float(res["normal"][1]), 4),
             "z": round(float(res["normal"][2]), 4),
         },
-        "mask_url": f"/masks/{out_name}",
-        "timings_s": res["timings"],
-        "debug": res["debug"]
+        **({"wall_size_m": wall_size} if wall_size else {}),
+        "original_url": f"/masks/{orig_name}",
+        "mask_url":     f"/masks/{mask_name}",
+        "timings_s":    res["timings"],
+        "debug":        res["debug"],
     }
 
 # ─── API endpoints ───────────────────────────────────────────────
