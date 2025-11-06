@@ -12,6 +12,9 @@ from fastapi.staticfiles import StaticFiles
 import cv2
 import torch
 import psutil
+import numpy as np 
+from mapanything.models import MapAnything
+from mapanything.utils.image import load_images
 
 # ─── Optional GPU monitor ────────────────────────────────────────
 try:
@@ -27,6 +30,51 @@ try:
     GPU_AVAILABLE = True
 except:
     GPU_AVAILABLE = False
+
+
+# ─── MapAnything singleton ─────────────────────────────────────
+_DEV = ("mps" if torch.backends.mps.is_available()
+        else "cuda" if torch.cuda.is_available()
+        else "cpu")
+_MAPANY = MapAnything.from_pretrained("facebook/map-anything").to(_DEV)
+
+@torch.inference_mode()
+def _metric_dims(photo_p: Path, mask_p: Path):
+    """
+    Returns {"width_m": float, "height_m": float} for photo+mask.
+    """
+    pred = _MAPANY.infer(load_images([str(photo_p)]),
+                         use_amp=False,
+                         memory_efficient_inference=True)[0]
+    pts  = pred["pts3d"][0].cpu().numpy()           # H×W×3
+
+    mask_full = cv2.imread(str(mask_p), cv2.IMREAD_GRAYSCALE) > 128
+    H, W = pts.shape[:2]
+    mask = cv2.resize(mask_full.astype(np.uint8), (W, H),
+                      interpolation=cv2.INTER_NEAREST).astype(bool)
+
+    def span(arr, axis):
+        best = (-1, -1, -1, -1)
+        if axis:
+            for r,row in enumerate(arr):
+                cols = np.where(row)[0]
+                if cols.size and (L:=cols[-1]-cols[0]) > best[3]:
+                    best = (r, cols[0], cols[-1], L)
+        else:
+            for c in range(arr.shape[1]):
+                rows = np.where(arr[:,c])[0]
+                if rows.size and (L:=rows[-1]-rows[0]) > best[3]:
+                    best = (c, rows[0], rows[-1], L)
+        return best[:3]
+
+    def d(a,b): return float(np.linalg.norm(a-b))
+
+    row,c0,c1 = span(mask,1)
+    col,r0,r1 = span(mask,0)
+    return {
+        "width_m":  round(d(pts[row,c0], pts[row,c1]), 3),
+        "height_m": round(d(pts[r0,col], pts[r1,col]), 3),
+    }
 
 # ─── Wrapper class ───────────────────────────────────────────────
 class WallRefiner:
@@ -152,11 +200,11 @@ class WallRefiner:
 
 # ─── Model modules ───────────────────────────────────────────────
 gen_mobile = importlib.import_module("wall_mask_generator_mobile")
-gen_hq     = importlib.import_module("wall_mask_generator")
+# gen_hq     = importlib.import_module("wall_mask_generator")
 
 refiners = {
     "mobile": WallRefiner(gen_mobile),
-    "hq":     WallRefiner(gen_hq),
+    # "hq":     WallRefiner(gen_hq),
 }
 
 # ─── FastAPI boilerplate ─────────────────────────────────────────
@@ -171,36 +219,41 @@ app = FastAPI(
 
 app.mount("/masks", StaticFiles(directory=str(MASK_DIR)), name="masks")
 
-# ─── Core handler ────────────────────────────────────────────────
-# ───────── core handler ─────────────────────────────────────────
+
 def _handle(file: UploadFile, model_key: str):
     if file.content_type not in ("image/jpeg", "image/png"):
         raise HTTPException(status_code=415, detail="JPEG or PNG only")
 
-    # one UUID for both original photo and generated mask
+    # --- always work with PNG internally ---
     uid = uuid.uuid4().hex
-    ext = Path(file.filename).suffix.lower() or ".jpg"
-    tmp = f"/tmp/{uid}{ext}"
+    tmp_upload = f"/tmp/{uid}_upload.png"
 
-    # save upload to temp file
-    with open(tmp, "wb") as fh:
+    # save uploaded file temporarily
+    with open(tmp_upload, "wb") as fh:
         shutil.copyfileobj(file.file, fh)
 
     try:
-        # run full pipeline
-        res = refiners[model_key].run(tmp)
+        # run full inference pipeline
+        res = refiners[model_key].run(tmp_upload)
 
-        # move the original image next to masks/
-        orig_name = f"{uid}{ext}"
-        shutil.move(tmp, MASK_DIR / orig_name)
+        # convert and save original image as PNG (lossless, consistent)
+        orig_name = f"{uid}.png"
+        img = cv2.imread(tmp_upload)
+        if img is None:
+            raise ValueError("Cannot read uploaded image for saving.")
+        cv2.imwrite(str(MASK_DIR / orig_name), img)
 
     except Exception as exc:
-        if os.path.exists(tmp):           # cleanup on failure
-            os.remove(tmp)
+        if os.path.exists(tmp_upload):
+            os.remove(tmp_upload)
         raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        # cleanup temp upload
+        if os.path.exists(tmp_upload):
+            os.remove(tmp_upload)
 
-    # move the refined mask (always .png) next to original
-    mask_name = f"{uid}.png"
+    # save refined mask next to original image with _mask suffix
+    mask_name = f"{uid}_mask.png"
     shutil.move(res["mask_path"], MASK_DIR / mask_name)
 
     # optional wall-size values (only if present in res)
@@ -210,7 +263,9 @@ def _handle(file: UploadFile, model_key: str):
         else None
     )
 
+    # --- build final API response ---
     return {
+        "id": uid, 
         "rotation": {
             "pitch": round(res["pitch"], 2),
             "yaw":   round(res["yaw"],   2),
@@ -223,8 +278,8 @@ def _handle(file: UploadFile, model_key: str):
         },
         "fallback_used": res["debug"].get("fallback_used", False),
         **({"wall_size_m": wall_size} if wall_size else {}),
-        "original_url": f"/masks/{orig_name}",
-        "mask_url":     f"/masks/{mask_name}",
+        "original_url": f"/masks/{uid}.png",         # ← always PNG
+        "mask_url":     f"/masks/{uid}_mask.png",    # ← always _mask.png
         "timings_s":    res["timings"],
         "debug":        res["debug"],
     }
@@ -235,7 +290,28 @@ async def process_mobile(file: UploadFile = File(...)):
     "Runs the lightweight ViT-B SAM model."
     return _handle(file, "mobile")
 
-@app.post("/process_hq")
-async def process_hq(file: UploadFile = File(...)):
-    "Runs the heavier HQ ViT-L SAM model."
-    return _handle(file, "hq")
+# @app.post("/process_hq")
+# async def process_hq(file: UploadFile = File(...)):
+#     "Runs the heavier HQ ViT-L SAM model."
+#     return _handle(file, "hq")
+
+@app.get("/measure/{image_id}")
+async def measure(image_id: str):
+    """
+    Returns metric wall width/height for a previously-processed image.
+    Looks for MASK_DIR/<ID>.png  and  MASK_DIR/<ID>_mask.png
+    """
+    photo_p = MASK_DIR / f"{image_id}.png"
+    mask_p  = MASK_DIR / f"{image_id}_mask.png"
+
+    if not photo_p.exists() or not mask_p.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Files not found for ID '{image_id}'. "
+                   "Run /process_mobile or /process_hq first."
+        )
+    try:
+        return _metric_dims(photo_p, mask_p)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
