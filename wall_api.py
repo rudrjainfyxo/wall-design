@@ -138,7 +138,7 @@ class WallRefiner:
         ratio = refined_area / total_pixels if total_pixels else 0
         res_fallback = False
 
-        if ratio < 0.2:
+        if ratio < 0.01:
             print(f"[WARN] Fallback → refined mask area only {ratio*100:.1f}% of image. Using DeepLab mask.")
             refined = (dense.astype('uint8')) * 255
             res_fallback = True

@@ -195,19 +195,25 @@ def hqsam_refine(photo_bgr, coarse_mask):
     refined_area = np.count_nonzero(refined)
     coarse_area  = np.count_nonzero(coarse_mask)
     coverage_ratio = refined_area / total_pixels
-    intersection = np.logical_and(refined > 0, coarse_mask > 0).sum()
-    union        = np.logical_or(refined > 0, coarse_mask > 0).sum()
-    iou = intersection / union if union > 0 else 0
+        # ─── IoU check using combined coarse reference ─────────────────────────
+    # Build a broader reference region from YOLO ∪ DeepLab (coarse_mask already ≈ that)
+    coarse_union = (coarse_mask > 0)
 
-    # ─── adaptive thresholds ───────────────────────────────────────
-    min_ratio = 0.25 if total_pixels > 512*512 else 0.15
-    min_iou   = 0.35
+    intersection = np.logical_and(refined > 0, coarse_union).sum()
+    union        = np.logical_or(refined > 0, coarse_union).sum()
+    iou = intersection / union if union > 0 else 0.0
 
-    # ─── fallback condition ────────────────────────────────────────
+    # ─── adaptive thresholds (more forgiving + configurable) ───────────────
+    min_ratio = float(os.getenv("MIN_WALL_RATIO", "0.10"))       # 10 % default
+    min_iou   = float(os.getenv("MIN_SAM_IOU", "0.20"))          # 0.20 default
+
+    # ─── fallback condition ────────────────────────────────────────────────
     if coverage_ratio < min_ratio or iou < min_iou:
-        print(f"[WARN] SAM mask fallback → area={coverage_ratio*100:.1f}%  IoU={iou:.2f}")
+        print(f"[WARN] SAM mask fallback → area={coverage_ratio*100:.1f}%  IoU={iou:.2f}  "
+              f"(thresholds: {min_ratio*100:.1f}% / {min_iou:.2f})")
         _dbg("4d_sam_too_small_or_drift", refined)
-        refined = clean_mask(coarse_mask)  # fallback to DeepLab
+        refined = clean_mask(coarse_mask)  # fallback to combined coarse mask
+
 
     # ─── debug outputs ─────────────────────────────────────────────
     _dbg("4a_sam_input", coarse_mask)
