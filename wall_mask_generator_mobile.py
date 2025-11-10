@@ -155,20 +155,21 @@ def _homography_to_rotation_and_normal(quad, W, H):
 
 def wall_pose(quad, W, H):
     """
-    High-level helper used by FastAPI wrapper.
-
-    Returns:
-      pitch, yaw, roll  (degrees, X-Y-Z, Unity order)
-      normal            (3-vector, camera space)
+    Returns
+    -------
+    pitch, yaw, roll : float   # degrees, X-Y-Z order
+    normal           : 3-vec   # camera space
+    R_cam2wall       : 3×3 np.float32  # camera→wall rotation
     """
+    # unchanged helper that you already have
     R, n = _homography_to_rotation_and_normal(quad, W, H)
 
-    pitch =  np.degrees(np.arctan2(R[2, 1], R[2, 2]))     # X
-    yaw   =  np.degrees(np.arctan2(-R[2, 0],
-                                   np.sqrt(R[2, 1]**2 + R[2, 2]**2)))  # Y
-    roll  =  np.degrees(np.arctan2(R[1, 0], R[0, 0]))     # Z
+    pitch = np.degrees(np.arctan2(R[2, 1], R[2, 2]))
+    yaw   = np.degrees(np.arctan2(-R[2, 0],
+                                  np.sqrt(R[2, 1]**2 + R[2, 2]**2)))
+    roll  = np.degrees(np.arctan2(R[1, 0], R[0, 0]))
 
-    return pitch, yaw, roll, n
+    return pitch, yaw, roll, n, R.astype(np.float32)
 
 # ─── HQ-SAM refine ───────────────────────────────────────────────
 def hqsam_refine(photo_bgr, coarse_mask):

@@ -196,7 +196,7 @@ class WallRefiner:
         # ─ pose calc ─
         t4 = time.perf_counter()
         quad = self.rw.wall_quad(refined)
-        pitch, yaw, roll, normal = self.rw.wall_pose(quad, img.shape[1], img.shape[0])
+        pitch, yaw, roll, normal, R = self.rw.wall_pose(quad, img.shape[1], img.shape[0])
         times["pose_compute_s"] = round(time.perf_counter() - t4, 2)
 
         # ─ save mask ─
@@ -241,6 +241,7 @@ class WallRefiner:
             "roll": roll,
             "normal": normal,
             "timings": times,
+            "rot_mat":  R.tolist(),
             "debug": debug
         }
 
@@ -312,6 +313,7 @@ def _handle(file: UploadFile, model_key: str):
     # --- build final API response ---
     return {
         "id": uid, 
+        "rotation_matrix_cam": res["rot_mat"],
         "rotation": {
             "pitch": round(res["pitch"], 2),
             "yaw":   round(res["yaw"],   2),
