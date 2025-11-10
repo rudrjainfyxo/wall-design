@@ -76,6 +76,52 @@ def _metric_dims(photo_p: Path, mask_p: Path):
         "height_m": round(d(pts[r0,col], pts[r1,col]), 3),
     }
 
+# ─── Camera→wall distance (metric) ────────────────────────────────
+@torch.inference_mode()
+def _metric_distance(photo_p: Path, mask_p: Path) -> float:
+    """
+    Finite distance (metres) from camera origin to the wall plane.
+
+    1. Try RANSAC plane fit (needs open3d).
+    2. Fallback = robust median-Z.
+       If mask has no valid pixels → raise ValueError that bubbles to 404.
+    """
+    pred = _MAPANY.infer(load_images([str(photo_p)]),
+                         use_amp=False,
+                         memory_efficient_inference=True)[0]
+    pts = pred["pts3d"][0].cpu().numpy()          # H×W×3
+
+    # resize mask → pts3d resolution
+    mask = cv2.imread(str(mask_p), cv2.IMREAD_GRAYSCALE) > 128
+    H, W = pts.shape[:2]
+    mask = cv2.resize(mask.astype(np.uint8), (W, H),
+                      interpolation=cv2.INTER_NEAREST).astype(bool)
+
+    # ── 1) fast path: RANSAC plane ───────────────────────────────
+    try:
+        import open3d as o3d
+        xyz  = pts[mask]                          # N×3
+        if xyz.shape[0] < 50:                     # too few inliers → skip
+            raise RuntimeError("mask too small")
+
+        pc   = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(xyz))
+        _, pl = pc.segment_plane(distance_threshold=0.01,
+                                 ransac_n=3, num_iterations=300)
+        a, b, c, d = pl
+        dist = abs(d) / np.linalg.norm([a, b, c])
+
+    # ── 2) fallback: median-Z ────────────────────────────────────
+    except Exception:
+        z_vals = pts[..., 2][mask]
+        if z_vals.size == 0:
+            raise ValueError("Wall mask has no valid depth pixels.")
+        dist = float(np.nanmedian(z_vals))
+        if not np.isfinite(dist):
+            raise ValueError("Depth values are NaN/Inf.")
+
+    return round(float(dist), 3)
+
+
 # ─── Wrapper class ───────────────────────────────────────────────
 class WallRefiner:
     def __init__(self, rw_module):
@@ -284,6 +330,8 @@ def _handle(file: UploadFile, model_key: str):
         "debug":        res["debug"],
     }
 
+
+
 # ─── API endpoints ───────────────────────────────────────────────
 @app.post("/process_mobile")
 async def process_mobile(file: UploadFile = File(...)):
@@ -296,11 +344,8 @@ async def process_mobile(file: UploadFile = File(...)):
 #     return _handle(file, "hq")
 
 @app.get("/measure/{image_id}")
+@app.get("/measure/{image_id}")
 async def measure(image_id: str):
-    """
-    Returns metric wall width/height for a previously-processed image.
-    Looks for MASK_DIR/<ID>.png  and  MASK_DIR/<ID>_mask.png
-    """
     photo_p = MASK_DIR / f"{image_id}.png"
     mask_p  = MASK_DIR / f"{image_id}_mask.png"
 
@@ -308,10 +353,12 @@ async def measure(image_id: str):
         raise HTTPException(
             status_code=404,
             detail=f"Files not found for ID '{image_id}'. "
-                   "Run /process_mobile or /process_hq first."
+                   "Run /process_mobile first."
         )
+
     try:
-        return _metric_dims(photo_p, mask_p)
+        dims   = _metric_dims(photo_p, mask_p)     # width / height
+        dist_m = _metric_distance(photo_p, mask_p) # wall distance
+        return {**dims, "distance_m": dist_m}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
