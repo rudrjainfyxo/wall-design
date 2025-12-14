@@ -29,11 +29,14 @@ YOLO_SRC     = Path.home() / 'code' / 'ultralytics'
 CONF_DEF     = 0.35
 TILE_IMG     = 'tile.jpeg'          # 1-pixel-trimmed tile (tiling only)
 FEATHER_PX   = 3
-CLEAN_K      = 7
-CLEAN_SIGMA  = 1.5
+# CLEAN_K      = 7
+# CLEAN_SIGMA  = 1.5
 SAM_WEIGHTS  = 'sam_vit_b_01ec64.pth'   # ViT-L backbone (faster on M-series)
 MODEL_KEY    = 'vit_b'
 DEBUG_SAVE = True
+MIN_BLOB_PERCENT = 0.1
+CLOSE_KERNEL_SIZE = 15
+SMOOTH_K_SIZE = (5, 5)
 # ──────────────────────────────────────────────────────────────────
 
 # --- DEBUG OUTPUT SETTINGS ---------------------------------------
@@ -107,12 +110,44 @@ class DeepLab:
         return cv2.resize(logits.astype(np.uint8), (w, h), cv2.INTER_NEAREST)
 
 # ─── helpers ──────────────────────────────────────────────────────
+
 def clean_mask(m):
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (CLEAN_K, CLEAN_K))
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
-    m = cv2.morphologyEx(m, cv2.MORPH_OPEN , k)
-    m = cv2.GaussianBlur(m, (0, 0), sigmaX=CLEAN_SIGMA)
-    return ((m > 127).astype(np.uint8)) * 255
+    """
+    Three-stage aggressive cleaning routine:
+    1. Connected Components: Removes small isolated noise dots.
+    2. Morphological Closing: Fills holes inside white regions.
+    3. Blur & Threshold: Smooths jagged edges resulting from step 2.
+    """
+    # Ensure input is valid single channel uint8
+    if m.ndim > 2: m = m[:,:,0]
+    m = m.astype(np.uint8)
+
+    # --- Step 1: Remove "Dotted Spread" (Noise) ---
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(m, connectivity=8)
+
+    # Calculate minimum pixel area threshold based on config percentage
+    H, W = m.shape[:2]
+    min_pixel_area = int(H * W * (MIN_BLOB_PERCENT / 100.0))
+
+    # Create base mask keeping only large blobs
+    cleaned_dots_mask = np.zeros_like(m)
+    for i in range(1, num_labels): # skip background label 0
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area > min_pixel_area:
+            cleaned_dots_mask[labels == i] = 255
+
+    # --- Step 2: Fill Small Holes ---
+    # Dilate then erode to close internal gaps
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (CLOSE_KERNEL_SIZE, CLOSE_KERNEL_SIZE))
+    closed_mask = cv2.morphologyEx(cleaned_dots_mask, cv2.MORPH_CLOSE, k_close)
+
+    # --- Step 3: Smooth Edges ---
+    # Apply Gaussian blur to soften jagged edges created by the large closing kernel
+    blurred = cv2.GaussianBlur(closed_mask, SMOOTH_K_SIZE, 0)
+    # Threshold back to strict binary (0 or 255) to get a sharp, smooth edge
+    _, smoothed_final = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
+
+    return smoothed_final
 
 def order_quad(q):
     s = q.sum(1); d = np.diff(q, axis=1).ravel()
