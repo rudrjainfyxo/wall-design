@@ -5,8 +5,9 @@ Launch:
     uvicorn wall_api:app --host 0.0.0.0 --port 8000 --reload
 """
 
-import uuid, os, shutil, importlib, time, platform
+import uuid, os, shutil, importlib, time, platform, asyncio
 from pathlib import Path
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.staticfiles import StaticFiles
 import cv2
@@ -37,6 +38,36 @@ _DEV = ("mps" if torch.backends.mps.is_available()
         else "cuda" if torch.cuda.is_available()
         else "cpu")
 _MAPANY = MapAnything.from_pretrained("facebook/map-anything").to(_DEV)
+
+# ─── Directory and Cleanup Logic ───────────────────────────────
+MASK_DIR = Path(__file__).parent / "masks"
+MASK_DIR.mkdir(exist_ok=True)
+
+def purge_all_data():
+    """Removes all files and folders inside the masks directory."""
+    print(f"Purging data in {MASK_DIR}...")
+    for path in MASK_DIR.iterdir():
+        try:
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
+        except Exception as e:
+            print(f"Error deleting {path}: {e}")
+
+async def periodic_cleanup():
+    """Background task to clear data every 2 hours."""
+    while True:
+        await asyncio.sleep(2 * 3600)  # Wait for 2 hours
+        purge_all_data()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. When server starts purge all data
+    purge_all_data()
+    # 2. Start background task for every 2 hours
+    asyncio.create_task(periodic_cleanup())
+    yield
 
 @torch.inference_mode()
 def _metric_dims(photo_p: Path, mask_p: Path):
@@ -255,13 +286,11 @@ refiners = {
 }
 
 # ─── FastAPI boilerplate ─────────────────────────────────────────
-MASK_DIR = Path(__file__).parent / "masks"
-MASK_DIR.mkdir(exist_ok=True)
-
 app = FastAPI(
     title="Wall-Mask Refinement API",
     description="YOLO ∩ DeepLab ∪ HQ-SAM (mobile & HQ) wrapped in FastAPI",
     version="0.6.0",
+    lifespan=lifespan  # Registered the lifespan event here
 )
 
 app.mount("/masks", StaticFiles(directory=str(MASK_DIR)), name="masks")
